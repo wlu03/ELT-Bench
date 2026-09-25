@@ -11,9 +11,18 @@ in `../../elt-bench/`. For every database it:
      directory. File tools (Read/Write/Edit/Glob/Grep) operate on the host
      bind mount and appear inside the container automatically. Shell commands
      are routed through a custom `container_bash` MCP tool that runs
-     `docker exec` inside the task's container — the native Bash tool is NOT
-     exposed, so the agent cannot run arbitrary host commands.
-  4. Streams the trajectory and writes `claude/result.json` with the
+     `docker exec` inside the task's container. The native Bash tool (and
+     every other host-reaching tool) is disallowed, and a PreToolUse hook
+     confines the file tools to the mount: reads anywhere under it, writes
+     only under `elt/`. `/workspace/...` paths are rewritten to the mount so
+     the model can use the container's view of the tree. User-level settings,
+     plugins and MCP servers are not loaded (`setting_sources=[]`,
+     `strict_mcp_config`), so nothing from the operator's own Claude Code
+     configuration reaches the agent.
+  4. Audits the finished trajectory (`claude/sandbox_audit.json`): any call to
+     a disallowed tool, any file-tool path outside the mount, and every hook
+     denial are recorded; the run is marked `sandbox_clean`.
+  5. Streams the trajectory and writes `claude/result.json` with the
      transcript, turn count, cost, and final status.
 
 Usage:
@@ -38,6 +47,7 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -54,6 +64,7 @@ if str(AGENTS_DIR) not in sys.path:
     sys.path.insert(0, str(AGENTS_DIR))
 
 from common import (  # noqa: E402
+    DestinationPreparationError,
     adapt_prompt,
     destination_choices,
     get_destination,
@@ -148,6 +159,202 @@ NATIVE_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
 CONTAINER_BASH_MCP_SERVER = "elt"
 CONTAINER_BASH_TOOL = f"mcp__{CONTAINER_BASH_MCP_SERVER}__container_bash"
 DEFAULT_BASH_TIMEOUT_SEC = 600
+
+# Host-reaching tools the CLI must never offer. `allowed_tools` only decides
+# what is auto-approved; in `acceptEdits` mode the CLI still auto-runs
+# read-only Bash inside the cwd, so Bash has to be disallowed outright.
+DISALLOWED_TOOLS = [
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "WebFetch",
+    "WebSearch",
+    "Agent",
+    "Task",
+    "NotebookEdit",
+    "NotebookRead",
+    "TodoWrite",
+    "Skill",
+    "EnterPlanMode",
+    "ExitPlanMode",
+]
+FILE_TOOL_MATCHER = "Read|Write|Edit|MultiEdit|Glob|Grep|NotebookEdit|NotebookRead"
+WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+PATH_INPUT_KEYS = ("file_path", "path", "notebook_path")
+FORBIDDEN_PATH_MARKERS = ("answer_key", "/private/", "/releases/", "ELT-taskgen")
+
+
+def _hook_deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+class SandboxGuard:
+    """Confine Claude Code's host-side file tools to one task mount.
+
+    Reads may touch anything under the mount; writes only `mount/elt`. A
+    `/workspace/...` path (the container's view) is rewritten to the mount so
+    the model's container-relative paths work on the host too. Every refusal
+    is recorded for the post-run audit.
+    """
+
+    def __init__(self, mount_dir: Path) -> None:
+        self.mount = Path(mount_dir).resolve()
+        self.elt = self.mount / "elt"
+        self.denials: list[dict[str, Any]] = []
+        self.rewrites: int = 0
+
+    def map_path(self, raw: str) -> Path:
+        text = raw
+        if text == CONTAINER_WORKDIR or text.startswith(CONTAINER_WORKDIR + "/"):
+            text = str(self.mount / text[len(CONTAINER_WORKDIR):].lstrip("/"))
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = self.mount / path
+        return path
+
+    @staticmethod
+    def _inside(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root)
+        except (ValueError, OSError):
+            return False
+        return True
+
+    def check(self, tool_name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+        """Return (denial reason or None, possibly rewritten input)."""
+        updated = dict(tool_input)
+        changed = False
+        keys = [
+            key for key in PATH_INPUT_KEYS
+            if isinstance(tool_input.get(key), str) and tool_input[key]
+        ]
+        if tool_name in ("Glob", "Grep"):
+            pattern = tool_input.get("pattern")
+            if isinstance(pattern, str) and pattern.startswith("/"):
+                keys.append("pattern")
+        for key in keys:
+            raw = tool_input[key]
+            path = self.map_path(raw)
+            if not self._inside(path, self.mount):
+                return (
+                    f"{tool_name} may only access files under the task mount "
+                    f"({self.mount}, seen as {CONTAINER_WORKDIR} in the container); "
+                    f"refused {raw!r}",
+                    tool_input,
+                )
+            if tool_name in WRITE_TOOLS and not self._inside(path, self.elt):
+                return (
+                    f"{tool_name} may only modify files under {CONTAINER_WORKDIR}/elt "
+                    f"({self.elt} on the host); refused {raw!r}",
+                    tool_input,
+                )
+            if str(path) != raw:
+                updated[key] = str(path)
+                changed = True
+        return None, (updated if changed else tool_input)
+
+    async def pre_tool_use(self, input_data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        tool_name = str(input_data.get("tool_name", ""))
+        tool_input = input_data.get("tool_input") or {}
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        reason, updated = self.check(tool_name, tool_input)
+        if reason is not None:
+            self.denials.append({"tool": tool_name, "input": tool_input, "reason": reason})
+            logger.warning("sandbox denied %s: %s", tool_name, reason)
+            return _hook_deny(reason)
+        if updated is not tool_input:
+            self.rewrites += 1
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": updated,
+                }
+            }
+        return {}
+
+    async def deny_host_tool(self, input_data: Any, tool_use_id: str | None, context: Any) -> dict[str, Any]:
+        tool_name = str(input_data.get("tool_name", ""))
+        reason = (
+            f"{tool_name} runs on the host and is not available; use the "
+            f"container_bash tool for every shell command"
+        )
+        self.denials.append({"tool": tool_name, "input": input_data.get("tool_input"), "reason": reason})
+        logger.warning("sandbox denied host tool %s", tool_name)
+        return _hook_deny(reason)
+
+    def hooks(self) -> dict[str, list[HookMatcher]]:
+        return {
+            "PreToolUse": [
+                HookMatcher(matcher=FILE_TOOL_MATCHER, hooks=[self.pre_tool_use]),
+                HookMatcher(matcher="|".join(DISALLOWED_TOOLS), hooks=[self.deny_host_tool]),
+            ]
+        }
+
+
+def audit_trajectory(turns: list[dict[str, Any]], guard: SandboxGuard) -> dict[str, Any]:
+    """Scan a finished trajectory for calls that got past the sandbox.
+
+    A flagged call whose tool result is an error was refused and is recorded
+    as an attempt. A flagged call that returned normally, or has no recorded
+    result, is recorded as an escape. Only escapes and forbidden host markers
+    make the run unclean. A path under /private/tmp is the mount itself on
+    macOS and is not a marker hit unless the text also names a release path.
+    """
+    results: dict[str, bool] = {}
+    for turn in turns:
+        if turn.get("role") != "user":
+            continue
+        for block in turn.get("content", []):
+            if block.get("type") == "tool_result" and block.get("tool_use_id"):
+                results[str(block["tool_use_id"])] = bool(block.get("is_error"))
+    attempts: list[dict[str, Any]] = []
+    escapes: list[dict[str, Any]] = []
+    forbidden_markers: list[dict[str, Any]] = []
+    file_tools = set(FILE_TOOL_MATCHER.split("|"))
+    for turn in turns:
+        if turn.get("role") != "assistant":
+            continue
+        for block in turn.get("content", []):
+            if block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name", ""))
+            tool_input = block.get("input") or {}
+            flagged: str | None = None
+            if name in DISALLOWED_TOOLS:
+                flagged = f"host tool {name}"
+            elif name in file_tools and isinstance(tool_input, dict):
+                reason, _ = guard.check(name, tool_input)
+                if reason is not None:
+                    flagged = reason
+            if flagged is not None:
+                record = {"tool": name, "input": tool_input, "reason": flagged}
+                if results.get(str(block.get("id")), False):
+                    attempts.append(record)
+                else:
+                    escapes.append(record)
+            text = json.dumps(tool_input, default=str)
+            hits = [marker for marker in FORBIDDEN_PATH_MARKERS if marker in text]
+            if hits == ["/private/"] and str(guard.mount) in text and "/releases/" not in text:
+                hits = []
+            if hits:
+                forbidden_markers.append({"tool": name, "markers": hits, "input": text[:400]})
+    return {
+        "mount": str(guard.mount),
+        "denied_attempts": attempts,
+        "escapes": escapes,
+        "forbidden_markers": forbidden_markers,
+        "hook_denials": guard.denials,
+        "path_rewrites": guard.rewrites,
+        "sandbox_clean": not (escapes or forbidden_markers),
+    }
 
 
 # ---------- helpers ----------
@@ -355,13 +562,12 @@ async def _run_task_body(
     model: str,
     max_turns: int,
 ) -> None:
-    # Prep Databricks DB.
     task_input_dir = inputs_root / db
-    try:
-        namespace = prepare_destination(destination, task_input_dir, credential)
-        logger.info("Prepared %s destination namespace %s", destination, namespace)
-    except Exception as e:  # pragma: no cover
-        logger.warning("Destination preparation for %s failed: %s", db, e)
+
+    # A failed reset means stale warehouse state: abort this attempt before
+    # any container, agent session, or evaluation can observe it.
+    namespace = prepare_destination(destination, task_input_dir, credential)
+    logger.info("Prepared %s destination namespace %s", destination, namespace)
 
     # Copy seed files into the mount dir.
     copy_initial_files(task_input_dir, out_dir)
@@ -430,11 +636,16 @@ async def _run_task_body(
         tools=[container_bash],
     )
 
+    guard = SandboxGuard(out_dir)
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         cwd=str(out_dir.resolve()),
         allowed_tools=NATIVE_ALLOWED_TOOLS + [CONTAINER_BASH_TOOL],
+        disallowed_tools=DISALLOWED_TOOLS,
         mcp_servers={CONTAINER_BASH_MCP_SERVER: mcp_server},
+        strict_mcp_config=True,
+        setting_sources=[],
+        hooks=guard.hooks(),
         permission_mode="acceptEdits",
         max_turns=max_turns,
         model=model,
@@ -461,6 +672,15 @@ async def _run_task_body(
 
     # Persist result.
     (out_dir / "claude").mkdir(parents=True, exist_ok=True)
+    audit = audit_trajectory(recorder.turns, guard)
+    with open(out_dir / "claude" / "sandbox_audit.json", "w") as f:
+        json.dump(audit, f, indent=2, default=str)
+    if audit["sandbox_clean"]:
+        logger.info("sandbox audit clean (%d hook denials, %d path rewrites)",
+                    len(audit["hook_denials"]), audit["path_rewrites"])
+    else:
+        logger.error("SANDBOX AUDIT FAILED for %s: %s", instance_id,
+                     json.dumps({k: audit[k] for k in ("escapes", "forbidden_markers")}, default=str)[:2000])
     result_json = {
         "instance_id": instance_id,
         "db": db,
@@ -470,6 +690,7 @@ async def _run_task_body(
         "total_cost_usd": recorder.total_cost_usd,
         "usage": recorder.usage,
         "result": recorder.final_text,
+        "sandbox_clean": audit["sandbox_clean"],
         "trajectory": recorder.turns,
     }
     with open(result_path, "w") as f:
@@ -510,6 +731,7 @@ async def main_async(args: argparse.Namespace) -> None:
         databases = databases[: args.limit]
 
     logger.info("Experiment %s — %d tasks", experiment_id, len(databases))
+    failures = 0
     for db in databases:
         try:
             await run_task(
@@ -523,8 +745,13 @@ async def main_async(args: argparse.Namespace) -> None:
                 max_turns=args.max_turns,
                 overwrite=args.overwrite,
             )
+        except DestinationPreparationError as exc:
+            failures += 1
+            logger.error("Task %s aborted before the agent session: %s", db, exc)
         except Exception:
             logger.exception("Task %s failed", db)
+    if failures:
+        raise SystemExit(f"{failures} task(s) aborted: destination preparation failed")
 
 
 def parse_args() -> argparse.Namespace:
